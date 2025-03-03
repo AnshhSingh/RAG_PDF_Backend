@@ -1,5 +1,5 @@
 # Setup
-## This is the easiest way to setup and run the backend without a lot of time Folllow the steps below:
+## This is the method to setup and run:
 - Visit [https://colab.research.google.com/drive/1Xha2XgoOQQ8oLurqG8-g0LyrIONF7fkd?usp=sharing](https://colab.research.google.com/drive/1xCC7svPvqoGIx3nEy0kV9Y-fz0nDxHYx#scrollTo=WxxEIslimCDn)
 - Run each cells 
 - add the ngrok token and api key as explained in the notebook
