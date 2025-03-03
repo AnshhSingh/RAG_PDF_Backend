@@ -1,3 +1,4 @@
+
 import torch
 import shutil
 import os
@@ -21,14 +22,22 @@ from pyngrok import ngrok
 import uvicorn
 from threading import Thread
 from llama_index.core import load_index_from_storage
+from supabase import create_client
 
 # Apply async fixes and load environment variables
 nest_asyncio.apply()
 load_dotenv()
 
 # Validate required environment variables
-if not os.getenv("LLAMA_CLOUD_API_KEY"):
-    raise ValueError("LLAMA_CLOUD_API_KEY environment variable not set")
+required_env_vars = [
+    "LLAMA_CLOUD_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY"
+]
+for var in required_env_vars:
+    if not os.getenv(var):
+        raise ValueError(f"{var} environment variable not set")
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # CUDA optimizations
@@ -88,18 +97,17 @@ Settings.llm = llm
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-      allow_origins=["*"],  # Allow requests from any origin
-      allow_credentials=True,  # Allow credentials (e.g., cookies, authorization headers)
-      allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-
-# Set up directories for file uploads and parsed texts
-UPLOAD_DIR = "uploads"
+# Set up directories
+PDF_DIR = "pdf"
 PARSED_DIR = "parsed_texts"
 INDEX_DIR = "index_storage"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(PDF_DIR, exist_ok=True)
 os.makedirs(PARSED_DIR, exist_ok=True)
 os.makedirs(INDEX_DIR, exist_ok=True)
 
@@ -107,11 +115,9 @@ parser = LlamaParse(result_type="markdown")
 
 # Initialize or load vector index
 if os.path.exists(os.path.join(INDEX_DIR, "docstore.json")):
-    # Load existing index
     storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
     index = load_index_from_storage(storage_context)
 else:
-    # Create new index from existing parsed texts
     documents = []
     for filename in os.listdir(PARSED_DIR):
         if filename.endswith(".txt"):
@@ -129,7 +135,6 @@ else:
         index = VectorStoreIndex([])
         index.storage_context.persist(persist_dir=INDEX_DIR)
 
-# Function to parse PDF files
 def parse_pdf(file_path: str) -> str:
     try:
         file_extractor = {".pdf": parser}
@@ -142,30 +147,52 @@ def parse_pdf(file_path: str) -> str:
     except Exception as e:
         raise RuntimeError(f"PDF parsing failed: {str(e)}")
 
-# Endpoint to handle PDF uploads
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are allowed")
 
     file_id = uuid.uuid4().hex
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}.pdf")
+    file_path = os.path.join(PDF_DIR, f"{file_id}.pdf")
+    supabase_success = False
 
     try:
-        # Save the uploaded PDF
+        # Save PDF file
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        # Initialize Supabase client
+        supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+        # Prepare metadata
+        upload_data = {
+            "file_id": file_id,
+            "filename": file.filename,
+            "upload_date": datetime.utcnow().isoformat(),
+            "file_path": file_path
+        }
+
+        # Insert metadata into Supabase
+        supabase_response = supabase.table("documents").insert(upload_data).execute()
+
+        # Debugging: Print the entire response
+        print("Supabase response:", supabase_response)
+
+        # Check for errors in the response
+        if not supabase_response.data:
+            raise RuntimeError(f"Supabase error: {supabase_response}")
+
+        supabase_success = True
+
+        # Process document
         parsed_text = parse_pdf(file_path)
         if not parsed_text:
             raise HTTPException(500, "PDF parsing returned empty content")
 
-        # Save parsed text
         parsed_path = os.path.join(PARSED_DIR, f"{file_id}.txt")
         with open(parsed_path, "w", encoding="utf-8") as f:
             f.write(parsed_text)
 
-        # Process and index document
         document = Document(text=parsed_text)
         nodes = node_parser.get_nodes_from_documents([document])
         index.insert_nodes(nodes)
@@ -174,29 +201,26 @@ async def upload_pdf(file: UploadFile = File(...)):
         return {"file_id": file_id, "message": "PDF processed successfully"}
 
     except Exception as e:
+        # Cleanup PDF if metadata storage failed
+        if not supabase_success and os.path.exists(file_path):
+            os.remove(file_path)
         traceback.print_exc()
         raise HTTPException(500, f"Processing error: {str(e)}")
 
-# Data model for query requests
 class QueryRequest(BaseModel):
     query: str
-    max_length: Optional[int] = 200
+    max_length: Optional[int] = 500
 
-# Endpoint to handle queries
 @app.post("/query")
 async def query(request: QueryRequest):
     if not request.query.strip():
         raise HTTPException(400, "Query cannot be empty")
 
     try:
-        query_engine = index.as_query_engine(
-            similarity_top_k=5,
-        )
-
+        query_engine = index.as_query_engine(similarity_top_k=5)
         response = query_engine.query(request.query)
         response_text = response.response if response else "No relevant information found."
 
-        # Truncate response based on token count
         tokens = tokenizer.encode(response_text, return_tensors="pt")[0]
         truncated_tokens = tokens[:min(len(tokens), request.max_length)]
         final_response = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
@@ -207,14 +231,11 @@ async def query(request: QueryRequest):
         traceback.print_exc()
         raise HTTPException(500, f"Query failed: {str(e)}")
 
-# Function to run the FastAPI server using uvicorn
 def run_server():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
 
-# Start the server in a background thread
 server_thread = Thread(target=run_server, daemon=True)
 server_thread.start()
 
-# Expose the server via ngrok and print the public URL
-public_url = ngrok.connect(8000).public_url
+public_url = ngrok.connect(8001).public_url
 print("Public URL:", public_url)
