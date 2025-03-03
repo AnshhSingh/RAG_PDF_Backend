@@ -3,152 +3,218 @@ import shutil
 import os
 import uuid
 import nest_asyncio
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from llama_cloud_services import LlamaParse
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Document
-from llama_index.core.node_parser import SentenceSplitter  # Added for chunking
+from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Document, StorageContext
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.core import Settings
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from llama_index.core import Settings, PromptTemplate
+from transformers import AutoTokenizer
 from pydantic import BaseModel
+import traceback
+from llama_index.llms.huggingface import HuggingFaceLLM
+from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
+from pyngrok import ngrok
+import uvicorn
+from threading import Thread
+from llama_index.core import load_index_from_storage
 
-# Apply Nest AsyncIO
+# Apply async fixes and load environment variables
 nest_asyncio.apply()
-
-# Load environment variables
 load_dotenv()
 
-# Optimize CUDA settings
+# Validate required environment variables
+if not os.getenv("LLAMA_CLOUD_API_KEY"):
+    raise ValueError("LLAMA_CLOUD_API_KEY environment variable not set")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# CUDA optimizations
 torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# Model configuration
-model_name = "HuggingFaceTB/SmolLM2-1.7B"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto"
+# Text processing: Initialize sentence splitter
+node_parser = SentenceSplitter(
+    chunk_size=512,
+    chunk_overlap=50,
+    paragraph_separator="\n\n",
+    secondary_chunking_regex="[^.,;。，]+[,.;。，]?",
 )
 
-# Configure text splitting
-node_parser = SentenceSplitter(chunk_size=512, chunk_overlap=50)  # Better chunking
+# Set up embedding model
+Settings.embed_model = HuggingFaceEmbedding(
+    model_name="BAAI/bge-small-en-v1.5",
+    embed_batch_size=16,
+)
 
-# Embedding model setup
-Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
-Settings.text_splitter = node_parser  # Apply chunking globally
+# Initialize tokenizer
+tokenizer = AutoTokenizer.from_pretrained(
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    padding_side="left",
+    use_fast=True
+)
 
+# LLM configuration and prompt template
+query_wrapper_prompt = PromptTemplate(
+    "Below is an instruction that describes a task.\n"
+    "Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n{query_str}\n\n### Response:"
+)
+
+# Determine torch dtype based on CUDA availability
+torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+llm = HuggingFaceLLM(
+    context_window=2048,
+    max_new_tokens=512,
+    generate_kwargs={
+        "temperature": 0.25,
+        "do_sample": False,
+        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id
+    },
+    tokenizer=tokenizer,
+    model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    device_map="auto",
+    model_kwargs={
+        "torch_dtype": torch_dtype,
+    }
+)
+Settings.llm = llm
+
+# Initialize FastAPI app with CORS
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+      allow_origins=["*"],  # Allow requests from any origin
+      allow_credentials=True,  # Allow credentials (e.g., cookies, authorization headers)
+      allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
+
+# Set up directories for file uploads and parsed texts
 UPLOAD_DIR = "uploads"
 PARSED_DIR = "parsed_texts"
+INDEX_DIR = "index_storage"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(PARSED_DIR, exist_ok=True)
+os.makedirs(INDEX_DIR, exist_ok=True)
 
 parser = LlamaParse(result_type="markdown")
 
-# Initialize index with chunking
-documents = []
-parsed_files = [os.path.join(PARSED_DIR, f) for f in os.listdir(PARSED_DIR) if f.endswith(".txt")]
+# Initialize or load vector index
+if os.path.exists(os.path.join(INDEX_DIR, "docstore.json")):
+    # Load existing index
+    storage_context = StorageContext.from_defaults(persist_dir=INDEX_DIR)
+    index = load_index_from_storage(storage_context)
+else:
+    # Create new index from existing parsed texts
+    documents = []
+    for filename in os.listdir(PARSED_DIR):
+        if filename.endswith(".txt"):
+            with open(os.path.join(PARSED_DIR, filename), "r", encoding="utf-8") as f:
+                text = f.read()
+            documents.append(Document(text=text))
+    
+    if documents:
+        nodes = node_parser.get_nodes_from_documents(documents)
+        storage_context = StorageContext.from_defaults()
+        storage_context.docstore.add_documents(nodes)
+        index = VectorStoreIndex(nodes, storage_context=storage_context)
+        storage_context.persist(persist_dir=INDEX_DIR)
+    else:
+        index = VectorStoreIndex([])
+        index.storage_context.persist(persist_dir=INDEX_DIR)
 
-for file_path in parsed_files:
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    documents.extend(node_parser.split_text(text))  # Split existing texts into chunks
-
-index = VectorStoreIndex.from_documents([Document(text=t) for t in documents])
-
-def parse_pdf(file_path: str):
-    """Parse PDF with enhanced error handling"""
+# Function to parse PDF files
+def parse_pdf(file_path: str) -> str:
     try:
         file_extractor = {".pdf": parser}
-        documents = SimpleDirectoryReader(
+        docs = SimpleDirectoryReader(
             input_files=[file_path],
-            file_extractor=file_extractor
+            file_extractor=file_extractor,
+            filename_as_id=True
         ).load_data()
-        return "\n".join([doc.text for doc in documents]) if documents else ""
+        return "\n".join(doc.text for doc in docs) if docs else ""
     except Exception as e:
-        print(f"PDF parsing error: {str(e)}")
-        return ""
+        raise RuntimeError(f"PDF parsing failed: {str(e)}")
 
-@app.post("/upload/")
+# Endpoint to handle PDF uploads
+@app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(400, "Only PDFs allowed")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are allowed")
 
-    file_id = str(uuid.uuid4())
+    file_id = uuid.uuid4().hex
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}.pdf")
 
     try:
+        # Save the uploaded PDF
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        if parsed_text := parse_pdf(file_path):
-            # Split and index chunks
-            text_chunks = node_parser.split_text(parsed_text)
-            for chunk in text_chunks:
-                index.insert(Document(text=chunk))
-            
-            # Save parsed content
-            with open(os.path.join(PARSED_DIR, f"{file_id}.txt"), "w") as f:
-                f.write(parsed_text)
-            
-            return {"file_id": file_id, "message": "PDF processed successfully"}
-        
-        raise HTTPException(500, "PDF parsing failed")
+        parsed_text = parse_pdf(file_path)
+        if not parsed_text:
+            raise HTTPException(500, "PDF parsing returned empty content")
+
+        # Save parsed text
+        parsed_path = os.path.join(PARSED_DIR, f"{file_id}.txt")
+        with open(parsed_path, "w", encoding="utf-8") as f:
+            f.write(parsed_text)
+
+        # Process and index document
+        document = Document(text=parsed_text)
+        nodes = node_parser.get_nodes_from_documents([document])
+        index.insert_nodes(nodes)
+        index.storage_context.persist(persist_dir=INDEX_DIR)
+
+        return {"file_id": file_id, "message": "PDF processed successfully"}
+
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(500, f"Processing error: {str(e)}")
 
+# Data model for query requests
 class QueryRequest(BaseModel):
     query: str
-    max_length: int = 200  # User-configurable response length
+    max_length: Optional[int] = 200
 
-@app.post("/query/")
+# Endpoint to handle queries
+@app.post("/query")
 async def query(request: QueryRequest):
-    if not request.query:
-        raise HTTPException(400, "Query required")
+    if not request.query.strip():
+        raise HTTPException(400, "Query cannot be empty")
 
     try:
-        # Retrieve relevant context chunks
-        retriever = index.as_retriever(similarity_top_k=2)  # Get top 2 chunks
-        results = retriever.retrieve(request.query)
-        context = "\n".join([n.node.text for n in results[:2]])
-
-        # Create structured prompt
-        prompt_template = f"""Summarize the context below to provide a concise answer to the query.
-        Context: {context}
-        Query: {request.query}
-        Concise Answer:"""
-        
-        # Tokenize with truncation
-        inputs = tokenizer(
-            prompt_template,
-            return_tensors="pt",
-            truncation=True,
-            max_length=2048
-        ).to(model.device)
-
-        # Generate with optimized parameters
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=request.max_length,
-            temperature=0.3,
-            top_p=0.9,
-            repetition_penalty=1.1,
-            do_sample=True,
-            eos_token_id=tokenizer.eos_token_id
+        query_engine = index.as_query_engine(
+            similarity_top_k=5,
         )
 
-        # Decode and clean response
-        response = tokenizer.decode(
-            outputs[0][inputs.input_ids.shape[-1]:],
-            skip_special_tokens=True
-        ).strip()
+        response = query_engine.query(request.query)
+        response_text = response.response if response else "No relevant information found."
 
-        return {"response": response, "context_used": context}
-    
+        # Truncate response based on token count
+        tokens = tokenizer.encode(response_text, return_tensors="pt")[0]
+        truncated_tokens = tokens[:min(len(tokens), request.max_length)]
+        final_response = tokenizer.decode(truncated_tokens, skip_special_tokens=True)
+
+        return {"response": final_response}
+
     except Exception as e:
-        raise HTTPException(500, f"Query error: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(500, f"Query failed: {str(e)}")
+
+# Function to run the FastAPI server using uvicorn
+def run_server():
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# Start the server in a background thread
+server_thread = Thread(target=run_server, daemon=True)
+server_thread.start()
+
+# Expose the server via ngrok and print the public URL
+public_url = ngrok.connect(8000).public_url
+print("Public URL:", public_url)
