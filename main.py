@@ -1,3 +1,5 @@
+#queryindexing and chatengine /query : https://docs.llamaindex.ai/en/stable/examples/customization/llms/SimpleIndexDemo-Huggingface_camel/
+#LLama parse for parsing pdf /upload : https://github.com/run-llama/llama_cloud_services/blob/main/parse.md
 
 import torch
 import shutil
