@@ -95,4 +95,20 @@ Start the server using:
 ```sh
 uvicorn main:app --host 0.0.0.0 --port 8001
 ```
+# Application Architecture
+
+## Backend
+The backend is built using **FastAPI** 
+1. Handling file uploads (`/upload` endpoint).
+2. Parsing PDF files using **LlamaParse**.
+3. Storing metadata in **Supabase**.
+4. Processing document embeddings with **LlamaIndex** and **HuggingFaceEmbedding**.
+5. Querying indexed documents (`/query` endpoint) using **LlamaIndex's Query Engine**.
+6. Running the server with **ngrok** for external access.
+
+### Frontend
+The frontend is a **React.js** application that allows users to:
+1. Upload PDF files to the backend..
+2. Send queries to the backend and display responses.
+3. Provide an interactive chat UI for querying document content.
 
