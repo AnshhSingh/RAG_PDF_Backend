@@ -89,10 +89,11 @@ Ensure the following environment variables are set:
 ## Dependencies
 - FastAPI
 - LlamaIndex
+- Llamaparse
 - HuggingFace Transformers
 - Supabase
 - PyTorch
-- Ngrok
+- Ngrok(optional)
 
 ## Running the API
 Start the server using:
