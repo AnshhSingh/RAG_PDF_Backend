@@ -1,6 +1,6 @@
 # Setup
 ## This is the method to setup and run:
-- Visit [https://colab.research.google.com/drive/1Xha2XgoOQQ8oLurqG8-g0LyrIONF7fkd?usp=sharing](https://colab.research.google.com/drive/1xCC7svPvqoGIx3nEy0kV9Y-fz0nDxHYx#scrollTo=WxxEIslimCDn)
+- Visit [This Collab link to auto setup ](https://colab.research.google.com/drive/1QFdUSov2nHMMj0tCt4-ZDNILN0vRUwMz)
 - Run each cells 
 - add the ngrok token and api key as explained in the notebook
 - your backend is now ready and should give you a ngrok public URL
